@@ -8,3 +8,8 @@ graphify-out/cache/
 # fichiers traduits générés (ex. film.fr.srt), sauf l'exemple
 *.*.srt
 !exemple/*.srt
+build/
+dist/
+*.spec
+*.*.vtt
+*.*.ass

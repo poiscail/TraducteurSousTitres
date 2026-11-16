@@ -1,12 +1,19 @@
 # Graph Report - TraducteurSousTitres  (2026-11-16)
 
 ## Corpus Check
-- Corpus is ~1,191 words - fits in a single context window. You may not need a graph.
+- 5 files · ~1,197 words
+- Verdict: corpus is large enough that graph structure adds value.
+- Unclassified: 5 file(s) not represented in the graph (top: .srt 2, (none) 1, .bat 1)
 
 ## Summary
 - 57 nodes · 91 edges · 9 communities (5 shown, 4 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 9 edges (avg confidence: 0.84)
 - Token cost: 0 input · 0 output
+
+## Graph Freshness
+- Built from commit: `690f2bdd`
+- Run `git rev-parse HEAD` and compare to check if the graph is stale.
+- Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
 - CLI et interface
@@ -72,7 +79,7 @@ Cohesion: 0.50
 Nodes (3): google(), traduire(), vider()
 
 ## Knowledge Gaps
-- **9 isolated node(s):** `Traducteur de sous-titres`, `Google Translate (moteur gratuit sans cle)`, `Lecture UTF-8 et Windows-1252, ecriture UTF-8`, `Nommage de sortie (film.srt vers film.fr.srt)`, `Traduire.bat (interface)` (+4 more)
+- **9 isolated node(s):** `Traduire.bat (interface)`, `Lecture UTF-8 et Windows-1252, ecriture UTF-8`, `Google Translate (moteur gratuit sans cle)`, `Codes de langue (-l)`, `Nommage de sortie (film.srt vers film.fr.srt)` (+4 more)
   These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 23 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
 - **4 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
@@ -81,7 +88,7 @@ _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `traduire_fichier()` connect `Traduction de fichier` to `CLI et interface`, `Parseur SRT`, `Moteur Google`, `Traduction par lots`?**
   _High betweenness centrality (0.139) - this node is a cross-community bridge._
-- **What connects `Traducteur de sous-titres`, `Google Translate (moteur gratuit sans cle)`, `Lecture UTF-8 et Windows-1252, ecriture UTF-8` to the rest of the system?**
+- **What connects `Traduire.bat (interface)`, `Lecture UTF-8 et Windows-1252, ecriture UTF-8`, `Google Translate (moteur gratuit sans cle)` to the rest of the system?**
   _9 weakly-connected nodes found - possible documentation gaps or missing edges._
 - **Why does `traduire_blocs()` connect `Traduction par lots` to `Parseur SRT`, `Traduction de fichier`, `Découpage des balises`, `Répartition des lignes`?**
   _High betweenness centrality (0.063) - this node is a cross-community bridge._
