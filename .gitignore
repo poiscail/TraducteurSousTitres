@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+config.json
+graphify-out/cache/
+# fichiers traduits générés (ex. film.fr.srt), sauf l'exemple
+*.*.srt
+!exemple/*.srt

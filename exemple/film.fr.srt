@@ -1,0 +1,17 @@
+1
+00:00:01,000 --> 00:00:03,500
+Bonjour, comment vas-tu aujourd'hui ?
+
+2
+00:00:04,000 --> 00:00:07,250
+<i>Je pense que nous devrions partir
+avant qu'il ne fasse nuit.</i>
+
+3
+00:00:08,100 --> 00:00:10,000
+- Où est la voiture ?
+- Derrière la maison.
+
+4
+00:01:02,500 --> 00:01:05,900
+{\an8}Merci beaucoup, mon ami.
