@@ -35,6 +35,9 @@ def interface(fichier=None):
 
     fen = tk.Tk()
     fen.title("Traducteur de sous-titres")
+    icone = Path(__file__).with_name("icone.ico")
+    if icone.exists():
+        fen.iconbitmap(icone)
     fen.resizable(False, False)
     chemin = tk.StringVar(value=fichier or "")
     langue = tk.StringVar(value="Français")
