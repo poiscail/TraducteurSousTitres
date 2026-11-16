@@ -70,7 +70,30 @@ def traduire_textes(textes: list[str], traduire, progres=None) -> list[str]:
     return resultats
 
 
-def traduire_blocs(blocs: list[Bloc], traduire, progres=None) -> list[Bloc]:
+def lire_glossaire(texte: str) -> list[tuple[str, str]]:
+    """Une entrée par ligne : « terme » (jamais traduit) ou « terme = traduction ». # = commentaire."""
+    entrees = []
+    for ligne in texte.splitlines():
+        ligne = ligne.split("#", 1)[0].strip()
+        if ligne:
+            terme, _, cible = ligne.partition("=")
+            entrees.append((terme.strip(), (cible or terme).strip()))
+    return sorted(entrees, key=lambda e: -len(e[0]))  # « Jon Snow » avant « Jon »
+
+
+def proteger(texte: str, glossaire) -> str:
+    """Remplace chaque terme du glossaire par un jeton <gN> que le moteur laisse tel quel."""
+    for n, (terme, _) in enumerate(glossaire):
+        texte = re.sub(rf"(?<!\w){re.escape(terme)}(?!\w)", f"<g{n}>", texte)
+    return texte
+
+
+def restaurer(texte: str, glossaire) -> str:
+    return re.sub(r"(?i)<\s*g\s*(\d+)\s*>", lambda m: glossaire[int(m[1])][1] if int(m[1]) < len(glossaire) else "",
+                  texte)
+
+
+def traduire_blocs(blocs: list[Bloc], traduire, progres=None, glossaire=()) -> list[Bloc]:
     """`traduire(texte) -> texte` ; numéros et timings recopiés tels quels.
     Les blocs sans timing (en-tête WEBVTT, NOTE, STYLE) sont recopiés sans traduction."""
     morceaux = [[decouper(l) for l in b.lignes] if b.timing else [] for b in blocs]
@@ -83,11 +106,11 @@ def traduire_blocs(blocs: list[Bloc], traduire, progres=None) -> list[Bloc]:
             segments += [(i, [k], m[k][1].strip(), True) for k in pleines]
         elif pleines:
             segments.append((i, pleines, " ".join(m[k][1].strip() for k in pleines), False))
-    traduits = traduire_textes([s[2] for s in segments], traduire, progres)
+    traduits = traduire_textes([proteger(s[2], glossaire) for s in segments], traduire, progres)
 
     nouvelles = [dict() for _ in blocs]
     for (i, ks, original, dialogue), t in zip(segments, traduits):
-        t = balises_intactes(original, t.strip())
+        t = balises_intactes(original, restaurer(t.strip(), glossaire))
         lignes = repartir(t, len(ks) if dialogue else nb_lignes(t, len(ks)))
         nouvelles[i].update(zip(ks, lignes))
         if len(lignes) > len(ks):  # ligne trop longue coupée en deux : la suite va avec la dernière
@@ -97,12 +120,28 @@ def traduire_blocs(blocs: list[Bloc], traduire, progres=None) -> list[Bloc]:
             for b, m, n in zip(blocs, morceaux, nouvelles)]
 
 
-def google(langue: str, source: str = "auto"):
-    """Moteur gratuit sans clé : point d'accès public de Google Translate (internet requis).
-    Réessaie avec une attente croissante si le service limite (erreur 429) ou coupe."""
+def _envoyer(requete) -> dict | list:
+    """POST JSON avec réessai et attente croissante si le service limite (429) ou coupe."""
     import json
     import time
     import urllib.error
+    import urllib.request
+
+    for essai in range(6):
+        try:
+            with urllib.request.urlopen(requete, timeout=30) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 500, 502, 503) or essai == 5:
+                raise
+        except urllib.error.URLError:
+            if essai == 5:
+                raise
+        time.sleep(2 ** essai)  # 1, 2, 4, 8, 16 s
+
+
+def google(langue: str, source: str = "auto"):
+    """Moteur gratuit sans clé : point d'accès public de Google Translate (internet requis)."""
     import urllib.parse
     import urllib.request
 
@@ -111,16 +150,58 @@ def google(langue: str, source: str = "auto"):
 
     def traduire(texte: str) -> str:
         donnees = urllib.parse.urlencode({"q": texte}).encode()
-        for essai in range(6):
-            try:
-                with urllib.request.urlopen(urllib.request.Request(url, donnees), timeout=30) as r:
-                    return "".join(morceau[0] for morceau in json.load(r)[0] if morceau[0])
-            except urllib.error.HTTPError as e:
-                if e.code not in (429, 500, 502, 503) or essai == 5:
-                    raise
-            except urllib.error.URLError:
-                if essai == 5:
-                    raise
-            time.sleep(2 ** essai)  # 1, 2, 4, 8, 16 s
+        return "".join(m[0] for m in _envoyer(urllib.request.Request(url, donnees))[0] if m[0])
 
     return traduire
+
+
+def deepl(langue: str, source: str = "auto", cle: str = ""):
+    """DeepL : meilleure qualité ; clé gratuite sur deepl.com (500 000 caractères par mois)."""
+    import urllib.parse
+    import urllib.request
+
+    if not cle:
+        raise ValueError("DeepL demande une clé (gratuite sur deepl.com/pro-api).")
+    hote = "api-free.deepl.com" if cle.endswith(":fx") else "api.deepl.com"
+    cible = {"en": "EN-US", "pt": "PT-PT", "zh-CN": "ZH-HANS"}.get(langue, langue.upper())
+    champs = {"text": "", "target_lang": cible, "tag_handling": "xml", "ignore_tags": "g"}
+    if source != "auto":
+        champs["source_lang"] = source.split("-")[0].upper()
+
+    def traduire(texte: str) -> str:
+        donnees = urllib.parse.urlencode({**champs, "text": texte}).encode()
+        requete = urllib.request.Request(f"https://{hote}/v2/translate", donnees,
+                                         {"Authorization": f"DeepL-Auth-Key {cle}"})
+        return _envoyer(requete)["translations"][0]["text"]
+
+    return traduire
+
+
+def argos(langue: str, source: str = "auto"):
+    """Argos Translate : hors ligne, après téléchargement du modèle de langue (une fois)."""
+    try:
+        import argostranslate.package
+        import argostranslate.translate
+    except ImportError:
+        raise ValueError("Moteur hors ligne absent : lance « pip install argostranslate ».") from None
+    if source == "auto":
+        raise ValueError("Le moteur hors ligne ne détecte pas la langue : choisis la langue d'origine.")
+    de, vers = source.split("-")[0], langue.split("-")[0]
+    installes = {(p.from_code, p.to_code) for p in argostranslate.package.get_installed_packages()}
+    if (de, vers) not in installes:
+        argostranslate.package.update_package_index()
+        modele = next((p for p in argostranslate.package.get_available_packages()
+                       if (p.from_code, p.to_code) == (de, vers)), None)
+        if modele is None:
+            raise ValueError(f"Pas de modèle hors ligne {de} → {vers}.")
+        argostranslate.package.install_from_path(modele.download())
+    return lambda texte: argostranslate.translate.translate(texte, de, vers)
+
+
+MOTEURS = {"Google (gratuit)": "google", "DeepL (clé)": "deepl", "Argos (hors ligne)": "argos"}
+
+
+def moteur(nom: str, langue: str, source: str = "auto", cle: str = ""):
+    if nom == "deepl":
+        return deepl(langue, source, cle)
+    return argos(langue, source) if nom == "argos" else google(langue, source)

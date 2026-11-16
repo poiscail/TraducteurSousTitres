@@ -115,3 +115,84 @@ def test_reessaie_si_429(monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", faux_urlopen)
     monkeypatch.setattr("time.sleep", lambda s: None)
     assert traduction.google("fr")("Hello") == "Bonjour" and len(appels) == 3
+
+
+def test_glossaire_protege_les_termes():
+    g = traduction.lire_glossaire("# commentaire\nWinterfell\nHand of the King = Main du Roi\n")
+    blocs = [srt.Bloc("1", "00:00:01,000 --> 00:00:02,000", ["The Hand of the King is in Winterfell"])]
+    sortie = traduction.traduire_blocs(blocs, str.upper, glossaire=g)[0].lignes
+    assert sortie == ["THE Main du Roi IS IN Winterfell"]
+
+
+def test_deepl(monkeypatch):
+    import io
+    vu = {}
+
+    def faux_urlopen(req, timeout):
+        vu["url"], vu["auth"] = req.full_url, req.get_header("Authorization")
+        return io.BytesIO(b'{"translations":[{"text":"Bonjour"}]}')
+
+    monkeypatch.setattr("urllib.request.urlopen", faux_urlopen)
+    assert traduction.moteur("deepl", "fr", cle="abc:fx")("Hello") == "Bonjour"
+    assert vu["url"] == "https://api-free.deepl.com/v2/translate" and vu["auth"] == "DeepL-Auth-Key abc:fx"
+
+
+def test_nom_unique_sans_ecraser(tmp_path):
+    entree = tmp_path / "film.srt"
+    assert traducteur.chemin_sortie(entree, "fr").name == "film.fr.srt"
+    (tmp_path / "film.fr.srt").write_text("", encoding="utf-8")
+    assert traducteur.chemin_sortie(entree, "fr").name == "film.fr (2).srt"
+    assert traducteur.deja_traduit(tmp_path / "film.fr (2).srt")
+
+
+def test_reparer():
+    blocs = srt.parser("5\n00:00:01,000 --> 00:00:03,000\nA\n\n9\n00:00:02,000 --> 00:00:04,000\nB\n\n"
+                       "10\n00:00:04,000 --> 00:00:05,000\nB\n\n11\n00:00:06,000 --> 00:00:07,000\n \n")
+    assert [(b.numero, b.timing, b.lignes) for b in srt.reparer(blocs)] == [
+        ("1", "00:00:01,000 --> 00:00:01,999", ["A"]),
+        ("2", "00:00:02,000 --> 00:00:05,000", ["B"])]
+
+
+def test_plusieurs_langues_en_ligne_de_commande(tmp_path, monkeypatch):
+    f = tmp_path / "a.srt"
+    f.write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
+    monkeypatch.setattr(traduction, "moteur", lambda *a, **k: str.upper)
+    monkeypatch.setattr(sys, "argv", ["traducteur.py", str(f), "-l", "fr,es"])
+    traducteur.main()
+    assert (tmp_path / "a.fr.srt").exists() and (tmp_path / "a.es.srt").exists()
+
+
+def test_video_avec_ffmpeg(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    video = tmp_path / "film.mkv"
+    video.write_bytes(b"")
+
+    def faux_run(cmd, **k):
+        Path(cmd[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(shutil, "which", lambda n: "ffmpeg")
+    monkeypatch.setattr(subprocess, "run", faux_run)
+    assert traducteur.traduire_fichier(video, "fr", traduire=str.upper).name == "film.fr.srt"
+
+
+def test_arret_pendant_la_traduction():
+    import pytest
+
+    def progres(fait, total):
+        raise traducteur.Annule
+
+    with pytest.raises(traducteur.Annule):
+        traduction.traduire_textes(["a"], str.upper, progres)
+
+
+def test_menu_contextuel(monkeypatch):
+    import types
+    ecrit = {}
+    faux = types.SimpleNamespace(HKEY_CURRENT_USER=0, REG_SZ=1,
+                                 SetValue=lambda racine, cle, t, v: ecrit.__setitem__(cle, v))
+    monkeypatch.setitem(sys.modules, "winreg", faux)
+    traducteur.menu_contextuel(True)
+    cle = r"Software\Classes\SystemFileAssociations\.srt\shell\TraduireSousTitres"
+    assert ecrit[cle] == "Traduire les sous-titres" and ecrit[cle + r"\command"].endswith('"%1"')
