@@ -102,3 +102,79 @@ def ecrire_ass(lignes: list[str], blocs: list[Bloc]) -> str:
     for b in blocs:
         lignes[int(b.numero)] = b.timing + "\\N".join(b.lignes).replace("\n", "\\N")
     return "\n".join(lignes)
+
+
+def _ass_hms(ms: int) -> str:
+    return f"{ms // 3600000}:{ms // 60000 % 60:02}:{ms // 1000 % 60:02}.{ms % 1000 // 10:02}"
+
+
+def decaler(blocs: list[Bloc], ms: int, ass: bool = False) -> list[Bloc]:
+    """Retarde (ms > 0) ou avance (ms < 0) tous les sous-titres, jamais avant 0."""
+    sortie = []
+    for b in blocs:
+        if not b.timing:
+            sortie.append(b)
+            continue
+        if ass:  # « Dialogue: 0,0:00:01.00,0:00:02.00,... »
+            p = b.timing.split(",")
+            p[1], p[2] = (_ass_hms(max(0, _ms(x) + ms)) for x in p[1:3])
+            timing = ",".join(p)
+        else:
+            d, f, reste, sep = _temps(b.timing)
+            timing = f"{_hms(max(0, d + ms), sep)} --> {_hms(max(0, f + ms), sep)}{reste}"
+        sortie.append(Bloc(b.numero, timing, b.lignes))
+    return sortie
+
+
+def _ass_vers_html(ligne: str) -> str:
+    r"""{\i1}…{\i0} devient <i>…</i> ; les autres codes ASS sont retirés."""
+    codes = {r"\i1": "<i>", r"\i0": "</i>", r"\b1": "<b>", r"\b0": "</b>", r"\u1": "<u>", r"\u0": "</u>"}
+    return re.sub(r"\{[^}]*\}", lambda m: "".join(v for k, v in codes.items() if k in m[0]), ligne)
+
+
+def _html_vers_ass(ligne: str) -> str:
+    codes = {"<i>": r"{\i1}", "</i>": r"{\i0}", "<b>": r"{\b1}", "</b>": r"{\b0}", "<u>": r"{\u1}", "</u>": r"{\u0}"}
+    return re.sub(r"<[^>]+>", lambda m: codes.get(m[0].lower(), ""), ligne)
+
+
+def vers_cues(blocs: list[Bloc], ass: bool = False) -> list[tuple[int, int, list[str]]]:
+    """Forme commune à tous les formats : (début ms, fin ms, lignes en balises <i>/<b>)."""
+    cues = []
+    for b in blocs:
+        if not b.timing:
+            continue  # en-tête WEBVTT, NOTE, STYLE : propres au format d'origine
+        lignes = [l for x in b.lignes for l in x.split("\n")]
+        if ass:
+            p = b.timing.split(",")
+            cues.append((_ms(p[1]), _ms(p[2]), [_ass_vers_html(l) for l in lignes]))
+        else:
+            d, f, _, _ = _temps(b.timing)
+            cues.append((d, f, lignes))
+    return cues
+
+
+ENTETE_ASS = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, \
+Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, \
+MarginV, Encoding
+Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+
+def ecrire_format(cues, fmt: str) -> str:
+    """Écrit les cues en srt, vtt ou ass."""
+    if fmt == "ass":
+        return ENTETE_ASS + "".join(f"Dialogue: 0,{_ass_hms(d)},{_ass_hms(f)},Default,,0,0,0,,"
+                                    + r"\N".join(_html_vers_ass(l) for l in lignes) + "\n" for d, f, lignes in cues)
+    sep = "," if fmt == "srt" else "."
+    corps = "\n\n".join((f"{n}\n" if fmt == "srt" else "") + f"{_hms(d, sep)} --> {_hms(f, sep)}\n" + "\n".join(lignes)
+                        for n, (d, f, lignes) in enumerate(cues, 1))
+    return ("WEBVTT\n\n" if fmt == "vtt" else "") + corps + "\n"

@@ -196,3 +196,53 @@ def test_menu_contextuel(monkeypatch):
     traducteur.menu_contextuel(True)
     cle = r"Software\Classes\SystemFileAssociations\.srt\shell\TraduireSousTitres"
     assert ecrit[cle] == "Traduire les sous-titres" and ecrit[cle + r"\command"].endswith('"%1"')
+
+
+def test_decaler_srt_et_ass():
+    blocs = srt.parser("1\n00:00:01,000 --> 00:00:02,500\nA\n")
+    assert srt.decaler(blocs, 1500)[0].timing == "00:00:02,500 --> 00:00:04,000"
+    assert srt.decaler(blocs, -5000)[0].timing == "00:00:00,000 --> 00:00:00,000"
+    _, ass = srt.parser_ass("Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,Salut")
+    assert srt.decaler(ass, 1000, ass=True)[0].timing == "Dialogue: 0,0:00:02.00,0:00:03.50,Default,,0,0,0,,"
+
+
+def test_conversion_de_format():
+    cues = srt.vers_cues(srt.parser("1\n00:00:01,000 --> 00:00:02,000\n<i>Salut</i>\ntoi\n"))
+    assert srt.ecrire_format(cues, "vtt") == "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n<i>Salut</i>\ntoi\n"
+    ass = srt.ecrire_format(cues, "ass")
+    assert ass.endswith("Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,," r"{\i1}Salut{\i0}\Ntoi" "\n")
+    _, blocs = srt.parser_ass(ass)
+    assert srt.ecrire_format(srt.vers_cues(blocs, ass=True), "srt") == \
+        "1\n00:00:01,000 --> 00:00:02,000\n<i>Salut</i>\ntoi\n"
+
+
+def test_decaler_et_convertir_sans_traduire(tmp_path, monkeypatch):
+    f = tmp_path / "a.srt"
+    f.write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["traducteur.py", str(f), "--decaler", "2", "--format", "vtt"])
+    traducteur.main()
+    assert (tmp_path / "a.vtt").read_text(encoding="utf-8") == "WEBVTT\n\n00:00:03.000 --> 00:00:04.000\nHi\n"
+    assert traducteur.traduire_fichier(f, decalage=-0.5).name == "a.modifie.srt"
+
+
+def test_integrer_dans_la_video(tmp_path, monkeypatch):
+    import shutil
+    import subprocess
+    video = tmp_path / "film.mp4"
+    video.write_bytes(b"")
+    commandes = []
+
+    def faux_run(cmd, **k):
+        commandes.append(cmd)
+        Path(cmd[-1]).write_text("1\n00:00:01,000 --> 00:00:02,000\nHi\n", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(shutil, "which", lambda n: "ffmpeg")
+    monkeypatch.setattr(subprocess, "run", faux_run)
+    sortie = traducteur.traduire_fichier(video, "fr", traduire=str.upper, integrer=True)
+    assert sortie.name == "film.fr.mp4"
+    assert "mov_text" in commandes[-1] and "language=fre" in commandes[-1]
+
+
+def test_plus_recente():
+    assert traducteur.plus_recente("1.10.0", "1.9.2") and not traducteur.plus_recente("1.1.0", "1.1.0")

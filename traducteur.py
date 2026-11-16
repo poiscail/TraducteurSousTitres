@@ -14,12 +14,18 @@ from pathlib import Path
 import srt
 import traduction
 
+VERSION = "1.1.0"
+DEPOT = "poiscail/TraducteurSousTitres"
 LANGUES = {"Français": "fr", "Anglais": "en", "Espagnol": "es", "Allemand": "de", "Italien": "it",
            "Portugais": "pt", "Néerlandais": "nl", "Russe": "ru", "Arabe": "ar", "Japonais": "ja",
            "Chinois": "zh-CN", "Coréen": "ko", "Turc": "tr", "Polonais": "pl"}
 AUTO = "Détection auto"
 EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa"}
 VIDEOS = {".mkv", ".mp4"}
+FORMATS = {"Identique": None, "SRT": "srt", "VTT": "vtt", "ASS": "ass"}
+# codes ISO 639-2 attendus par les pistes de sous-titres des vidéos
+ISO3 = {"fr": "fre", "en": "eng", "es": "spa", "de": "ger", "it": "ita", "pt": "por", "nl": "dut", "ru": "rus",
+        "ar": "ara", "ja": "jpn", "zh-CN": "chi", "ko": "kor", "tr": "tur", "pl": "pol"}
 CONFIG = Path(os.environ.get("APPDATA", Path.home())) / "TraducteurSousTitres.json"
 GLOSSAIRE = CONFIG.with_name("TraducteurSousTitres_glossaire.txt")
 MODELE_GLOSSAIRE = """# Glossaire du traducteur de sous-titres
@@ -33,11 +39,12 @@ class Annule(Exception):
     """Traduction arrêtée par l'utilisateur."""
 
 
-def chemin_sortie(entree: Path, langue: str) -> Path:
+def chemin_sortie(entree: Path, langue: str, suffixe: str = "") -> Path:
     """film.fr.srt, ou film.fr (2).srt s'il existe déjà : on n'écrase jamais une traduction."""
-    sortie, n = entree.with_name(f"{entree.stem}.{langue}{entree.suffix}"), 2
+    suffixe, base = suffixe or entree.suffix, f"{entree.stem}.{langue}" if langue else entree.stem
+    sortie, n = entree.with_name(base + suffixe), 2
     while sortie.exists():
-        sortie, n = entree.with_name(f"{entree.stem}.{langue} ({n}){entree.suffix}"), n + 1
+        sortie, n = entree.with_name(f"{base} ({n}){suffixe}"), n + 1
     return sortie
 
 
@@ -60,23 +67,41 @@ def lister(chemins) -> list[Path]:
     return fichiers
 
 
-def extraire_sous_titres(video: Path) -> Path:
-    """Sort la piste de sous-titres d'une vidéo en film.srt avec ffmpeg (à installer à part)."""
+def ffmpeg(*arguments):
+    """Lance ffmpeg (à installer à part) sans ouvrir de console."""
     import shutil
     import subprocess
 
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise ValueError("ffmpeg introuvable : installe-le (winget install ffmpeg) pour les vidéos.")
+    return subprocess.run([exe, "-y", "-v", "error", *map(str, arguments)], capture_output=True, text=True,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def extraire_sous_titres(video: Path) -> Path:
+    """Sort la piste de sous-titres d'une vidéo en film.srt."""
     sortie = video.with_suffix(".srt")
     if sortie.exists():
         return sortie
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise ValueError("ffmpeg introuvable : installe-le (winget install ffmpeg) pour lire les vidéos.")
     # shortcut: 1re piste de sous-titres seulement ; ajouter un choix de piste si on en a besoin
-    r = subprocess.run([ffmpeg, "-y", "-v", "error", "-i", str(video), "-map", "0:s:0", str(sortie)],
-                       capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    r = ffmpeg("-i", video, "-map", "0:s:0", sortie)
     if r.returncode or not sortie.exists():
         sortie.unlink(missing_ok=True)
         raise ValueError("Pas de piste de sous-titres texte dans la vidéo (les sous-titres en image ne sont pas lisibles).")
+    return sortie
+
+
+def integrer_video(video: Path, sous_titres: Path, langue: str | None = None) -> Path:
+    """Copie la vidéo avec les sous-titres en 1re piste (film.fr.mkv), sans réencoder image ni son."""
+    sortie = chemin_sortie(video, langue or "sous-titres")
+    mp4 = video.suffix.lower() == ".mp4"
+    r = ffmpeg("-i", video, "-i", sous_titres, "-map", "0:v?", "-map", "0:a?", "-map", "1", "-map", "0:s?",
+               *([] if mp4 else ["-map", "0:t?"]), "-c", "copy", *(["-c:s", "mov_text"] if mp4 else []),
+               "-metadata:s:s:0", f"language={ISO3.get(langue, 'und')}", "-disposition:s:0", "default", sortie)
+    if r.returncode or not sortie.exists():
+        sortie.unlink(missing_ok=True)
+        raise ValueError(f"Intégration dans la vidéo impossible : {(r.stderr or '').strip()[-200:]}")
     return sortie
 
 
@@ -87,29 +112,66 @@ def glossaire() -> list[tuple[str, str]]:
         return []
 
 
-def traduire_contenu(entree, langue: str, traduire=None, source="auto", progres=None, moteur="google", cle="",
-                     glossaire=(), reparer=False):
-    """Renvoie (fichier lu, blocs d'origine, blocs traduits, fonction qui produit le texte final)."""
+def traduire_contenu(entree, langue: str | None, traduire=None, source="auto", progres=None, moteur="google",
+                     cle="", glossaire=(), reparer=False, decalage=0.0, fmt=None):
+    """Renvoie (fichier lu, blocs d'origine, blocs finaux, fonction qui produit le texte, extension de sortie).
+    Sans langue : seulement réparation, décalage (en secondes) et conversion de format (srt, vtt, ass)."""
     entree = Path(entree)
     if entree.suffix.lower() in VIDEOS:
         entree = extraire_sous_titres(entree)
     texte = srt.lire_fichier(entree)
-    traduire = traduire or traduction.moteur(moteur, langue, source, cle)
-    if entree.suffix.lower() in (".ass", ".ssa"):
+    ass = entree.suffix.lower() in (".ass", ".ssa")
+    if ass:
         lignes, blocs = srt.parser_ass(texte)
         rendre = lambda b: srt.ecrire_ass(lignes, b)  # noqa: E731
     else:
         blocs, rendre = srt.parser(texte), srt.ecrire
         if reparer:
             blocs = srt.reparer(blocs, numeroter=entree.suffix.lower() == ".srt")
-    return entree, blocs, traduction.traduire_blocs(blocs, traduire, progres, glossaire), rendre
+    if decalage:
+        blocs = srt.decaler(blocs, round(decalage * 1000), ass)
+    suffixe = entree.suffix
+    if fmt and fmt != ("ass" if ass else suffixe.lower()[1:]):
+        rendre, suffixe = (lambda b: srt.ecrire_format(srt.vers_cues(b, ass), fmt)), f".{fmt}"
+    if langue:
+        finaux = traduction.traduire_blocs(blocs, traduire or traduction.moteur(moteur, langue, source, cle),
+                                           progres, glossaire)
+    else:
+        finaux = blocs
+    return entree, blocs, finaux, rendre, suffixe
 
 
-def traduire_fichier(entree, langue: str, **options) -> Path:
-    entree, _, traduits, rendre = traduire_contenu(entree, langue, **options)
-    sortie = chemin_sortie(entree, langue)
-    sortie.write_text(rendre(traduits), encoding="utf-8")
+def enregistrer(origine, entree: Path, langue, texte: str, suffixe: str, integrer=False) -> Path:
+    """Écrit film.fr.srt (film.vtt si seulement converti, film.modifie.srt si seulement décalé ou réparé),
+    puis l'intègre à la vidéo d'origine si demandé."""
+    etiquette = langue or ("" if suffixe.lower() != entree.suffix.lower() else "modifie")
+    sortie = chemin_sortie(entree, etiquette, suffixe)
+    sortie.write_text(texte, encoding="utf-8")
+    if integrer and Path(origine).suffix.lower() in VIDEOS:
+        return integrer_video(Path(origine), sortie, langue)
     return sortie
+
+
+def traduire_fichier(entree, langue: str | None = None, integrer=False, **options) -> Path:
+    lu, _, finaux, rendre, suffixe = traduire_contenu(entree, langue, **options)
+    return enregistrer(entree, lu, langue, rendre(finaux), suffixe, integrer)
+
+
+def derniere_version() -> tuple[str, str]:
+    """(numéro, page) de la dernière version publiée sur GitHub."""
+    import urllib.request
+
+    requete = urllib.request.Request(f"https://api.github.com/repos/{DEPOT}/releases/latest",
+                                     headers={"User-Agent": "TraducteurSousTitres"})
+    with urllib.request.urlopen(requete, timeout=5) as r:
+        donnees = json.load(r)
+    return donnees["tag_name"].lstrip("v"), donnees["html_url"]
+
+
+def plus_recente(version: str, actuelle: str = VERSION) -> bool:
+    def nombres(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+    return nombres(version) > nombres(actuelle)
 
 
 def commande_menu() -> str:
@@ -160,7 +222,7 @@ def interface(fichiers=()):
     except ImportError:
         DND_FILES, fen = None, tk.Tk()
 
-    fen.title("Traducteur de sous-titres")
+    fen.title(f"Traducteur de sous-titres {VERSION}")
     icone = Path(__file__).with_name("icone.ico")
     if icone.exists():
         fen.iconbitmap(icone)
@@ -176,6 +238,9 @@ def interface(fichiers=()):
     reparer = tk.BooleanVar(value=config.get("reparer", False))
     apercu = tk.BooleanVar(value=config.get("apercu", False))
     sombre = tk.BooleanVar(value=config.get("sombre", False))
+    integrer = tk.BooleanVar(value=config.get("integrer", False))
+    fmt = tk.StringVar(value=config.get("format", "Identique"))
+    decalage = tk.StringVar(value="0")
     etat = tk.StringVar(value="Choisis des sous-titres (.srt, .vtt, .ass, .mkv) et une ou plusieurs langues.")
     stop = threading.Event()
     style = ttk.Style(fen)
@@ -229,10 +294,10 @@ def interface(fichiers=()):
         except OSError as e:
             messagebox.showerror("Erreur", str(e))
 
-    def ouvrir_apercu(code, entree, blocs, traduits, rendre):
+    def ouvrir_apercu(code, origine, entree, blocs, traduits, rendre, suffixe):
         """Original et traduction côte à côte ; double-clic pour corriger, puis enregistrer."""
         win = tk.Toplevel(fen)
-        win.title(f"Aperçu : {entree.name} → {code}")
+        win.title(f"Aperçu : {entree.name} → {code or suffixe}")
         win.geometry("900x500")
         win.columnconfigure(0, weight=1)
         win.rowconfigure(0, weight=1)
@@ -274,9 +339,12 @@ def interface(fichiers=()):
             ttk.Button(boite, text="OK", command=valider).grid(pady=(0, 8))
             zone.focus_set()
 
-        def enregistrer():
-            sortie = chemin_sortie(entree, code)
-            sortie.write_text(rendre(traduits), encoding="utf-8")
+        def sauver():
+            try:
+                sortie = enregistrer(origine, entree, code, rendre(traduits), suffixe, integrer.get())
+            except (OSError, ValueError) as e:
+                messagebox.showerror("Erreur", str(e))
+                return
             etat.set(f"Enregistré : {sortie.name}")
             win.destroy()
 
@@ -284,19 +352,28 @@ def interface(fichiers=()):
         bas = ttk.Frame(win, padding=6)
         bas.grid(row=1, column=0, columnspan=2, sticky="e")
         ttk.Label(bas, text="Double-clic sur une ligne pour la corriger.").grid(row=0, column=0, padx=8)
-        ttk.Button(bas, text="Enregistrer", command=enregistrer).grid(row=0, column=1)
+        ttk.Button(bas, text="Enregistrer", command=sauver).grid(row=0, column=1)
         ttk.Button(bas, text="Annuler", command=win.destroy).grid(row=0, column=2, padx=(4, 0))
 
     def lancer():
         cibles = [liste.get(i) for i in liste.curselection()]
-        if not choix or not cibles:
-            messagebox.showerror("Erreur", "Choisis au moins un fichier et une langue cible.")
+        try:
+            secondes = float(decalage.get().replace(",", ".") or 0)
+        except ValueError:
+            messagebox.showerror("Erreur", "Décalage invalide : un nombre de secondes, par ex. 1.5 ou -2.")
+            return
+        modifier_seul = secondes or FORMATS[fmt.get()] or reparer.get()
+        if not choix or not (cibles or modifier_seul):
+            messagebox.showerror("Erreur", "Choisis au moins un fichier et une langue cible "
+                                           "(ou un décalage, un format, la réparation).")
             return
         ecrire_config(langues=cibles, source=source.get(), moteur=nom_moteur.get(), cle_deepl=cle.get().strip(),
-                      reparer=reparer.get(), apercu=apercu.get(), sombre=sombre.get())
+                      reparer=reparer.get(), apercu=apercu.get(), sombre=sombre.get(), integrer=integrer.get(),
+                      format=fmt.get())
         options = dict(source=LANGUES.get(source.get(), "auto"), moteur=traduction.MOTEURS[nom_moteur.get()],
-                       cle=cle.get().strip(), glossaire=glossaire(), reparer=reparer.get())
-        taches = [(f, LANGUES[c]) for f in choix for c in cibles]
+                       cle=cle.get().strip(), glossaire=glossaire(), reparer=reparer.get(), decalage=secondes,
+                       fmt=FORMATS[fmt.get()])
+        taches = [(f, LANGUES[c]) for f in choix for c in cibles] or [(f, None) for f in choix]
         voir = apercu.get() and len(taches) == 1
         stop.clear()
         bouton.config(state="disabled")
@@ -308,7 +385,7 @@ def interface(fichiers=()):
             for n, (f, code) in enumerate(taches):
                 if stop.is_set():
                     break
-                fen.after(0, etat.set, f"Traduction {n + 1}/{len(taches)} : {f.name} → {code}")
+                fen.after(0, etat.set, f"Traitement {n + 1}/{len(taches)} : {f.name} → {code or 'modifié'}")
 
                 def progres(fait, total, n=n):
                     if stop.is_set():
@@ -317,17 +394,17 @@ def interface(fichiers=()):
 
                 try:
                     if voir:
-                        fen.after(0, ouvrir_apercu, code, *traduire_contenu(f, code, progres=progres, **options))
+                        fen.after(0, ouvrir_apercu, code, f, *traduire_contenu(f, code, progres=progres, **options))
                     else:
-                        traduire_fichier(f, code, progres=progres, **options)
+                        traduire_fichier(f, code, integrer=integrer.get(), progres=progres, **options)
                     faits += 1
                 except Annule:
                     break
                 except Exception as e:  # erreur réseau, fichier invalide…
-                    erreurs.append(f"{f.name} → {code} : {e}")
+                    erreurs.append(f"{f.name} → {code or 'modifié'} : {e}")
             fin = "Arrêté" if stop.is_set() else "Terminé"
             fen.after(0, barre.config, {"value": 0 if stop.is_set() else 100})
-            fen.after(0, etat.set, f"{fin} : {faits}/{len(taches)} traduction(s).")
+            fen.after(0, etat.set, f"{fin} : {faits}/{len(taches)} fichier(s).")
             if erreurs:
                 fen.after(0, messagebox.showerror, "Erreurs", "\n".join(erreurs))
             fen.after(0, bouton.config, {"state": "normal"})
@@ -357,6 +434,11 @@ def interface(fichiers=()):
         .grid(row=0, column=3, sticky="w", padx=4)
     ttk.Label(reglages, text="Clé DeepL :").grid(row=0, column=4, sticky="w", padx=(12, 0))
     ttk.Entry(reglages, textvariable=cle, show="•", width=16).grid(row=0, column=5, sticky="w", padx=4)
+    ttk.Label(reglages, text="Format :").grid(row=1, column=0, sticky="w", pady=(6, 0))
+    ttk.Combobox(reglages, textvariable=fmt, values=list(FORMATS), state="readonly", width=16)\
+        .grid(row=1, column=1, sticky="w", padx=4, pady=(6, 0))
+    ttk.Label(reglages, text="Décalage (s) :").grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+    ttk.Entry(reglages, textvariable=decalage, width=8).grid(row=1, column=3, sticky="w", padx=4, pady=(6, 0))
 
     ttk.Label(cadre, text="Vers :").grid(row=2, column=0, sticky="nw")
     zone_liste = ttk.Frame(cadre)
@@ -378,6 +460,7 @@ def interface(fichiers=()):
     options.grid(row=2, column=2, sticky="nw")
     ttk.Checkbutton(options, text="Réparer le fichier", variable=reparer).grid(sticky="w")
     ttk.Checkbutton(options, text="Aperçu avant d'enregistrer", variable=apercu).grid(sticky="w")
+    ttk.Checkbutton(options, text="Intégrer à la vidéo", variable=integrer).grid(sticky="w")
     ttk.Checkbutton(options, text="Thème sombre", variable=sombre, command=theme).grid(sticky="w")
     ttk.Button(options, text="Glossaire…", command=ouvrir_glossaire).grid(sticky="we", pady=(6, 0))
     ttk.Button(options, text="Ajouter au clic droit", command=installer_menu).grid(sticky="we", pady=(4, 0))
@@ -391,6 +474,20 @@ def interface(fichiers=()):
     barre = ttk.Progressbar(cadre, maximum=100)
     barre.grid(row=4, column=0, columnspan=3, sticky="we", pady=(10, 0))
     ttk.Label(cadre, textvariable=etat).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+    maj = ttk.Button(cadre)
+
+    def verifier_maj():
+        try:
+            version, page = derniere_version()
+        except Exception:  # hors ligne : pas de vérification, sans gêner
+            return
+        if plus_recente(version):
+            import webbrowser
+            fen.after(0, lambda: (maj.config(text=f"Nouvelle version {version} disponible : télécharger",
+                                             command=lambda: webbrowser.open(page)),
+                                  maj.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))))
+
+    threading.Thread(target=verifier_maj, daemon=True).start()
     if DND_FILES:
         fen.drop_target_register(DND_FILES)
         fen.dnd_bind("<<Drop>>", lambda e: remplacer(fen.tk.splitlist(e.data)))
@@ -401,30 +498,39 @@ def interface(fichiers=()):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Traduit des sous-titres (.srt, .vtt, .ass, .mkv) en gardant le timing.")
+    p = argparse.ArgumentParser(description="Traduit, décale ou convertit des sous-titres (.srt, .vtt, .ass, .mkv).")
     p.add_argument("fichiers", nargs="*", help="fichier(s) ou dossier(s) de sous-titres")
     p.add_argument("-l", "--langue", help="langue(s) cible, séparées par des virgules : fr ou fr,es,de")
     p.add_argument("-s", "--source", default="auto", help="langue d'origine (défaut : détection auto)")
     p.add_argument("-m", "--moteur", choices=sorted(set(traduction.MOTEURS.values())), default="google")
     p.add_argument("--cle", default=os.environ.get("DEEPL_API_KEY", ""), help="clé DeepL (ou DEEPL_API_KEY)")
     p.add_argument("--reparer", action="store_true", help="renumérote, retire doublons et chevauchements")
+    p.add_argument("--decaler", type=float, default=0, metavar="SECONDES",
+                   help="décale tous les sous-titres (négatif : plus tôt), ex. 1.5 ou -2")
+    p.add_argument("--format", choices=["srt", "vtt", "ass"], help="convertit dans ce format")
+    p.add_argument("--integrer", action="store_true", help="ajoute la traduction en piste dans la vidéo (ffmpeg)")
+    p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--installer-menu", action="store_true", help="ajoute « Traduire les sous-titres » au clic droit")
     p.add_argument("--desinstaller-menu", action="store_true", help="retire l'entrée du clic droit")
+    if sys.stdout is None:  # .exe sans console (lancé par l'installateur) : print ne doit pas planter
+        sys.stdout = sys.stderr = open(os.devnull, "w")
     args = p.parse_args()
     if args.installer_menu or args.desinstaller_menu:
         menu_contextuel(args.installer_menu)
         print("Clic droit " + ("ajouté." if args.installer_menu else "retiré."))
         return
-    if not args.langue:  # pas de langue : interface (fichiers pré-remplis si glissés sur Traduire.bat)
+    if not (args.langue or args.decaler or args.format or args.reparer):
+        # rien à faire en ligne de commande : interface (fichiers pré-remplis si glissés sur Traduire.bat)
         interface(args.fichiers)
         return
     fichiers = lister(args.fichiers)
     if not fichiers:
         p.error("indique au moins un fichier .srt, .vtt, .ass, .mkv (ou un dossier)")
-    options = dict(source=args.source, moteur=args.moteur, cle=args.cle, glossaire=glossaire(), reparer=args.reparer)
+    options = dict(source=args.source, moteur=args.moteur, cle=args.cle, glossaire=glossaire(), reparer=args.reparer,
+                   decalage=args.decaler, fmt=args.format, integrer=args.integrer)
     for f in fichiers:
-        for langue in args.langue.split(","):
-            print(f"{f} -> {traduire_fichier(f, langue.strip(), **options)}")
+        for langue in args.langue.split(",") if args.langue else [None]:
+            print(f"{f} -> {traduire_fichier(f, langue and langue.strip(), **options)}")
 
 
 if __name__ == "__main__":
